@@ -14,6 +14,9 @@ from torch import Tensor, nn
 from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from dinov3.utils import named_apply
 
+from dinov3.layers import CubistMerger, bipartite_soft_matching, merge_wavg, TokenClusteringBlock, TokenReconstructionBlock
+
+
 logger = logging.getLogger("dinov3")
 
 ffn_layer_dict = {
@@ -54,6 +57,7 @@ def init_weights_vit(module: nn.Module, name: str = ""):
         module.reset_parameters()
     if isinstance(module, RMSNorm):
         module.reset_parameters()
+
 
 
 class DinoVisionTransformer(nn.Module):
@@ -179,6 +183,9 @@ class DinoVisionTransformer(nn.Module):
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
 
+        self.loc = -1
+        self.need_recover = False
+
     def init_weights(self):
         self.rope_embed._init_weights()
         nn.init.normal_(self.cls_token, std=0.02)
@@ -207,7 +214,6 @@ class DinoVisionTransformer(nn.Module):
                 dtype=cls_token.dtype,
                 device=cls_token.device,
             )
-
         x = torch.cat(
             [
                 cls_token.expand(B, -1, -1),
@@ -219,6 +225,70 @@ class DinoVisionTransformer(nn.Module):
 
         return x, (H, W)
 
+    def config_token_merging(self, opt, r, loc, need_recover=False):
+        self.opt = opt
+        self.r = r
+        self.loc = loc
+        self.need_recover = need_recover
+        if opt == "cume":
+            self.cubist_merger = CubistMerger()
+        elif opt == "expedite":
+            # default expedite setting
+            hourglass_cluster_iters = 5
+            hourglass_temperture = 0.01
+            hourglass_cluster_window_size = 5
+            hourglass_reconstruction_k = 20 
+            self.token_clustering_block = TokenClusteringBlock(
+                num_spixels=100, # placeholder, num_spixels may differ based in input
+                n_iters=hourglass_cluster_iters, 
+                temperture=hourglass_temperture, 
+                window_size=hourglass_cluster_window_size,
+            )
+            self.token_reconstruction_block = TokenReconstructionBlock(
+                k=hourglass_reconstruction_k,
+                temperture=hourglass_temperture,
+            )
+
+    def merge_tokens(self, x, hw):
+        self.hw = hw
+        H, W = hw
+        B, _, C = x.shape
+        if isinstance(self.r, int):
+            rh = rw = self.r
+        elif isinstance(self.r, float):
+            rh = torch.round(H * torch.tensor(self.r)).int().item()
+            rw = torch.round(W * torch.tensor(self.r)).int().item()
+        else:
+            raise ValueError("r is not int or float")
+
+        if self.opt == "cume":
+            self.cubist_merger.init(hw)
+            x = self.cubist_merger.merge(x, rh, rw)
+        elif self.opt == "expedite": 
+            self.token_clustering_block.num_spixels = (H-rh, W-rw)
+            self.reconstructer = self.token_reconstruction_block.derive_unpooler()
+            self.reconstructer.update_state(hw_shape=(H, W))
+            x = x.reshape(-1, H, W, C)
+            self.reconstructer.update_state(feat_before_pooling=x.view(-1, H*W, C))
+            x, hard_labels = self.token_clustering_block(x)  # B*H*W, Wh, Ww, C
+            self.reconstructer.update_state(hard_labels=hard_labels)
+            self.reconstructer.update_state(feat_after_pooling=x.view(B, -1, C))
+            x = x.reshape(B, -1, C)
+        elif self.opt == "tome":
+            r = H*W - (H-rh)*(W-rw)
+            merge, self.tome_unmerge = bipartite_soft_matching(x, r)
+            x, _ = merge_wavg(merge, x)
+        return x, (H-rh, W-rw)
+
+    def recover_tokens(self, x):
+        if self.opt == "cume":
+            x = self.cubist_merger.recover(x)
+        elif self.opt == "expedite": 
+            x, _ = self.reconstructer.call(x) # B*Nw, WH*WW, C
+        elif self.opt == "tome":
+            x = self.tome_unmerge(x)
+        return x
+
     def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
         x = []
         rope = []
@@ -226,12 +296,22 @@ class DinoVisionTransformer(nn.Module):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
             rope.append(hw_tuple)
-        for _, blk in enumerate(self.blocks):
+
+        for i, blk in enumerate(self.blocks):
+            if i == self.loc:
+                for i_x in range(len(x)):
+                    pad_token_count = x[i_x].shape[1] - rope[i_x][0]*rope[i_x][1]
+                    merged, rope[i_x] = self.merge_tokens(x[i_x][:, pad_token_count:, :], rope[i_x])
+                    x[i_x] = torch.cat((x[0][:, :pad_token_count, :], merged), dim=1)
             if self.rope_embed is not None:
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
+        if self.need_recover:
+            for i_x in range(len(x)):
+                merged = self.recover_tokens(x[i_x][:, pad_token_count:, :])
+                x[i_x] = torch.cat((x[0][:, :pad_token_count, :], merged), dim=1)
         all_x = x
         output = []
         for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
@@ -271,14 +351,24 @@ class DinoVisionTransformer(nn.Module):
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+
+        pad_token_count = x.shape[1] - H*W
         for i, blk in enumerate(self.blocks):
+            if i == self.loc:
+                merged, hw= self.merge_tokens(x[:, pad_token_count:, :], (H,W))
+                x = torch.cat((x[:, :pad_token_count, :], merged), dim=1)
+                H, W = hw
             if self.rope_embed is not None:
                 rope_sincos = self.rope_embed(H=H, W=W)
             else:
                 rope_sincos = None
             x = blk(x, rope_sincos)
             if i in blocks_to_take:
-                output.append(x)
+                if self.need_recover and i >= self.loc:
+                    unmerged = self.recover_tokens(x[:, pad_token_count:, :])
+                    output.append(torch.cat((x[:, :pad_token_count, :], unmerged), dim=1))
+                else:
+                    output.append(x)
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
         return output
 

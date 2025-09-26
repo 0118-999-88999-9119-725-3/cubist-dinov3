@@ -11,3 +11,6 @@ from .layer_scale import LayerScale
 from .patch_embed import PatchEmbed
 from .rms_norm import RMSNorm
 from .rope_position_encoding import RopePositionEmbedding
+from .cume import CubistMerger
+from .tome import bipartite_soft_matching, merge_wavg
+from .expedite import TokenClusteringBlock, TokenReconstructionBlock

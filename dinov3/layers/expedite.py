@@ -1,0 +1,193 @@
+import torch
+from torch.nn import functional as F
+import torch.nn as nn
+import math
+
+from torch.autograd import Variable
+
+class TokenClusteringBlock(nn.Module):
+    def __init__(self, num_spixels=None, n_iters=5, temperture=0.01, window_size=5):
+        super().__init__()
+        if isinstance(num_spixels, tuple):
+            assert len(num_spixels) == 2
+        elif num_spixels is not None:
+            x = int(math.sqrt(num_spixels))
+            assert x * x == num_spixels
+            num_spixels = (x, x)
+        self.num_spixels = num_spixels
+        self.n_iters = n_iters
+        self.temperture = temperture
+        assert window_size % 2 == 1
+        self.r = window_size // 2
+
+    def calc_init_centroid(self, images, num_spixels_width, num_spixels_height):
+        """
+        calculate initial superpixels
+
+        Args:
+            images: torch.Tensor
+                A Tensor of shape (B, C, H, W)
+            spixels_width: int
+                initial superpixel width
+            spixels_height: int
+                initial superpixel height
+
+        Return:
+            centroids: torch.Tensor
+                A Tensor of shape (B, C, H * W)
+            init_label_map: torch.Tensor
+                A Tensor of shape (B, H * W)
+            num_spixels_width: int
+                A number of superpixels in each column
+            num_spixels_height: int
+                A number of superpixels int each raw
+        """
+        batchsize, channels, height, width = images.shape
+        device = images.device
+
+        centroids = torch.nn.functional.adaptive_avg_pool2d(
+            images, (num_spixels_height, num_spixels_width)
+        )
+
+        with torch.no_grad():
+            num_spixels = num_spixels_width * num_spixels_height
+            labels = (
+                torch.arange(num_spixels, device=device)
+                .reshape(1, 1, *centroids.shape[-2:])
+                .type_as(centroids)
+            )
+            init_label_map = torch.nn.functional.interpolate(
+                labels, size=(height, width), mode="nearest"
+            ).type_as(centroids)
+            init_label_map = init_label_map.repeat(batchsize, 1, 1, 1)
+
+        init_label_map = init_label_map.reshape(batchsize, -1)
+        centroids = centroids.reshape(batchsize, channels, -1)
+
+        return centroids, init_label_map
+
+    def forward(self, pixel_features, num_spixels=None):
+        if num_spixels is None:
+            num_spixels = self.num_spixels
+            assert num_spixels is not None
+        else:
+            if isinstance(num_spixels, tuple):
+                assert len(num_spixels) == 2
+            else:
+                x = int(math.sqrt(num_spixels))
+                assert x * x == num_spixels
+                num_spixels = (x, x)
+
+        pixel_features = pixel_features.permute(0, 3, 1, 2)
+        num_spixels_height, num_spixels_width = num_spixels
+        num_spixels = num_spixels_width * num_spixels_height
+        spixel_features, init_label_map = self.calc_init_centroid(
+            pixel_features, num_spixels_width, num_spixels_height
+        )
+
+        device = init_label_map.device
+        spixels_number = torch.arange(num_spixels, device=device)[None, :, None]
+        relative_labels_widths = init_label_map[:, None] % num_spixels_width - spixels_number % num_spixels_width
+        relative_labels_heights = torch.div(init_label_map[:, None], num_spixels_width, rounding_mode='trunc') - torch.div(spixels_number, num_spixels_width, rounding_mode='trunc')
+        mask = torch.logical_and(torch.abs(relative_labels_widths) <= self.r, torch.abs(relative_labels_heights) <= self.r)
+        mask_dist = (~mask) * 1e16
+
+        pixel_features = pixel_features.reshape(*pixel_features.shape[:2], -1)  # (B, C, L)
+        permuted_pixel_features = pixel_features.permute(0, 2, 1)       # (B, L, C)
+
+        for _ in range(self.n_iters):
+            dist_matrix = self.pairwise_dist(pixel_features, spixel_features)    # (B, L', L)
+            dist_matrix += mask_dist
+            affinity_matrix = (-dist_matrix * self.temperture).softmax(1)
+            spixel_features = torch.bmm(affinity_matrix.detach(), permuted_pixel_features)
+            spixel_features = spixel_features / affinity_matrix.detach().sum(2, keepdim=True).clamp_(min=1e-16)
+            spixel_features = spixel_features.permute(0, 2, 1)
+        
+        dist_matrix = self.pairwise_dist(pixel_features, spixel_features)
+        hard_labels = torch.argmin(dist_matrix, dim=1)
+
+        B, C, _ = spixel_features.shape
+        spixel_features = spixel_features.permute(0, 2, 1).reshape(B, num_spixels_height, num_spixels_width, C)
+        return spixel_features, hard_labels
+
+    def pairwise_dist(self, f1, f2):
+        return ((f1 * f1).sum(dim=1).unsqueeze(1)
+                + (f2 * f2).sum(dim=1).unsqueeze(2)
+                - 2 * torch.einsum("bcm, bcn -> bmn", f2, f1))
+
+    def extra_repr(self):
+        return f"num_spixels={self.num_spixels}, n_iters={self.n_iters}"
+
+
+def naive_unpool(f_regions, region_indices):
+    _, _, C = f_regions.shape
+    N, L = region_indices.shape
+    index = region_indices.view(N, L, 1).expand(N, L, C)
+    result = f_regions.gather(1, index)
+    return result
+
+
+class State:
+    def __init__(self, unpooling):
+        self.unpooling = unpooling
+        self.__updated = False
+
+    @property
+    def updated(self):
+        return self.__updated
+
+    def get(self, name, default=None):
+        return getattr(self, name, default)
+
+    def update_state(self, **states: dict):
+        self.__updated = True
+        for k, v in states.items():
+            setattr(self, k, v)
+
+    def call(self, input: torch.Tensor):
+        return self.unpooling(input, self)
+
+
+class UnpoolingBase(nn.Module):
+    def forward(self, x, state: State):
+        if not state.updated:
+            return x, False
+        return self._forward(x, state)
+
+    def derive_unpooler(self):
+        return State(self)
+
+
+class NaiveUnpooling(UnpoolingBase):
+    def _forward(self, x, state: State):
+        return naive_unpool(x, state.hard_labels), False
+
+
+class TokenReconstructionBlock(UnpoolingBase):
+    def __init__(self, k=20, temperture=0.01):
+        super().__init__()
+
+        self.k = k
+        self.temperture = temperture
+
+    def _forward(self, x, state: State):
+        feat = state.feat_before_pooling
+        sfeat = state.feat_after_pooling
+        ds = (
+            (feat * feat).sum(dim=2).unsqueeze(2)
+            + (sfeat * sfeat).sum(dim=2).unsqueeze(1)
+            - 2 * torch.einsum("bnc, bmc -> bnm", feat, sfeat)
+        )  # distance between features and super-features
+        ds[ds < 0] = 0
+        weight = torch.exp(-self.temperture * ds)
+        if self.k >= 0:
+            topk, indices = torch.topk(weight, k=self.k, dim=2)
+            mink = torch.min(topk, dim=-1).values
+            mink = mink.unsqueeze(-1).repeat(1, 1, weight.shape[-1])
+            mask = torch.ge(weight, mink)
+            zero = Variable(torch.zeros_like(weight)).to(weight.device)
+            attention = torch.where(mask, weight, zero)
+        attention = F.normalize(attention, dim=2)
+        ret = torch.einsum("bnm, bmc -> bnc", attention, x)
+
+        return ret, False
